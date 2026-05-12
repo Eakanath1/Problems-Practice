@@ -10,9 +10,24 @@ Architecture:
 """
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Any, Optional, Callable
+
+# ========== RATE LIMIT DECISION ==========
+
+
+@dataclass
+class RateLimitDecision:
+    """Rich result object for rate limiting decisions."""
+
+    allowed: bool
+    remaining: int
+    retry_after_ms: Optional[int] = None
+    reason: Optional[str] = None
+
 
 # ========== STRATEGY INTERFACE ==========
 
@@ -21,7 +36,7 @@ class RateLimiterStrategy(ABC):
     """Interface for all rate limiting strategies."""
 
     @abstractmethod
-    async def give_access(self, rate_limit_key: Optional[str]) -> bool:
+    async def give_access(self, rate_limit_key: Optional[str]) -> RateLimitDecision:
         """Check if request should be allowed."""
         pass
 
@@ -57,19 +72,42 @@ class TokenBucketStrategy(RateLimiterStrategy):
     class Bucket:
         """Inner class representing an individual token bucket."""
 
-        def __init__(self, initial_tokens: int):
-            self.tokens = initial_tokens
+        def __init__(self, capacity: int, refill_rate: int):
+            self.tokens = capacity
+            self.capacity = capacity
+            self.refill_rate = refill_rate
+            self.last_refill_time = time.monotonic()
 
-        def try_consume(self) -> bool:
-            """Attempt to consume one token (caller must hold lock)."""
-            if self.tokens > 0:
+        def try_consume(self) -> RateLimitDecision:
+            """Attempt to consume one token with lazy refill (caller must hold lock)."""
+            # Lazy refill: calculate tokens based on elapsed time
+            now = time.monotonic()
+            elapsed = now - self.last_refill_time
+            tokens_to_add = elapsed * self.refill_rate
+            self.tokens = min(self.capacity, self.tokens + tokens_to_add)
+            self.last_refill_time = now
+
+            # Try to consume
+            if self.tokens >= 1:
                 self.tokens -= 1
-                return True
-            return False
+                return RateLimitDecision(
+                    allowed=True,
+                    remaining=int(self.tokens),
+                    retry_after_ms=None,
+                    reason=None,
+                )
+            else:
+                # Calculate retry_after: time needed to accumulate 1 token
+                tokens_needed = 1.0
+                time_to_wait = tokens_needed / self.refill_rate
+                retry_after_ms = int(time_to_wait * 1000)
 
-        def refill(self, capacity: int, refill_rate: int):
-            """Refill tokens up to capacity (caller must hold lock)."""
-            self.tokens = min(capacity, self.tokens + refill_rate)
+                return RateLimitDecision(
+                    allowed=False,
+                    remaining=0,
+                    retry_after_ms=retry_after_ms,
+                    reason="Rate limit exceeded",
+                )
 
     def __init__(self, bucket_capacity: int, refresh_rate: int):
         """
@@ -79,45 +117,14 @@ class TokenBucketStrategy(RateLimiterStrategy):
         """
         self.bucket_capacity = bucket_capacity
         self.refresh_rate = refresh_rate
-        self.global_bucket = self.Bucket(bucket_capacity)
+        self.global_bucket = self.Bucket(bucket_capacity, refresh_rate)
         self.global_lock = asyncio.Lock()
         # Per-key locking: each user key has its own lock and bucket
         self.user_buckets: Dict[str, "TokenBucketStrategy.Bucket"] = {}
         self.user_locks: Dict[str, asyncio.Lock] = {}
         self.dict_lock = asyncio.Lock()  # Lock for dictionary modifications
-        self.refill_task = None
 
-    def start_refill_task(self):
-        """Start the scheduled refill task."""
-        self.refill_task = asyncio.create_task(self._refill_loop())
-
-    async def _refill_loop(self):
-        """Periodic task to refill all buckets."""
-        while True:
-            await asyncio.sleep(1)  # 1 second interval
-
-            # Refill global bucket
-            async with self.global_lock:
-                self.global_bucket.refill(self.bucket_capacity, self.refresh_rate)
-
-            # Refill user buckets - get snapshot of keys to avoid dict modification during iteration
-            async with self.dict_lock:
-                user_keys = list(self.user_locks.keys())
-
-            for key in user_keys:
-                # Acquire per-key lock for safe refill
-                async with self.dict_lock:
-                    if key not in self.user_locks:
-                        continue  # Key was removed
-                    lock = self.user_locks[key]
-
-                async with lock:
-                    if key in self.user_buckets:
-                        self.user_buckets[key].refill(
-                            self.bucket_capacity, self.refresh_rate
-                        )
-
-    async def give_access(self, rate_limit_key: Optional[str]) -> bool:
+    async def give_access(self, rate_limit_key: Optional[str]) -> RateLimitDecision:
         """Check if request is allowed based on token availability."""
         if rate_limit_key:
             # Get or create per-key lock
@@ -125,7 +132,7 @@ class TokenBucketStrategy(RateLimiterStrategy):
                 if rate_limit_key not in self.user_locks:
                     self.user_locks[rate_limit_key] = asyncio.Lock()
                     self.user_buckets[rate_limit_key] = self.Bucket(
-                        self.bucket_capacity
+                        self.bucket_capacity, self.refresh_rate
                     )
                 lock = self.user_locks[rate_limit_key]
 
@@ -144,13 +151,8 @@ class TokenBucketStrategy(RateLimiterStrategy):
             self.refresh_rate = config["refresh_rate"]
 
     async def shutdown(self) -> None:
-        """Stop the refill task."""
-        if self.refill_task:
-            self.refill_task.cancel()
-            try:
-                await self.refill_task
-            except asyncio.CancelledError:
-                pass
+        """Clean up resources (no background tasks to stop with lazy refill)."""
+        pass
 
 
 # ========== FACTORY PATTERN ==========
@@ -187,9 +189,7 @@ class RateLimiterFactory:
 def _create_token_bucket(config: Dict[str, Any]) -> TokenBucketStrategy:
     capacity = config.get("capacity", 10)
     refresh_rate = config.get("refresh_rate", 1)
-    strategy = TokenBucketStrategy(capacity, refresh_rate)
-    strategy.start_refill_task()
-    return strategy
+    return TokenBucketStrategy(capacity, refresh_rate)
 
 
 RateLimiterFactory.register_factory(RateLimiterType.TOKEN_BUCKET, _create_token_bucket)
@@ -209,7 +209,9 @@ class RateLimiterController:
         """
         self.rate_limiter = RateLimiterFactory.create_limiter(limiter_type, config)
 
-    async def process_request(self, rate_limit_key: Optional[str] = None) -> bool:
+    async def process_request(
+        self, rate_limit_key: Optional[str] = None
+    ) -> RateLimitDecision:
         """
         Process a request with rate limiting.
 
@@ -217,12 +219,15 @@ class RateLimiterController:
             rate_limit_key: Key for per-user limiting, None for global
 
         Returns:
-            True if allowed, False if blocked
+            RateLimitDecision with allowed status and metadata
         """
-        allowed = await self.rate_limiter.give_access(rate_limit_key)
-        status = "✅ Allowed" if allowed else "❌ Blocked"
-        print(f"Request [{rate_limit_key or 'global'}]: {status}")
-        return allowed
+        decision = await self.rate_limiter.give_access(rate_limit_key)
+        status = "✅ Allowed" if decision.allowed else "❌ Blocked"
+        extra = f" (remaining: {decision.remaining}" + (
+            f", retry: {decision.retry_after_ms}ms)" if decision.retry_after_ms else ")"
+        )
+        print(f"Request [{rate_limit_key or 'global'}]: {status}{extra}")
+        return decision
 
     async def update_configuration(self, config: Dict[str, Any]):
         """Update rate limiter configuration."""
@@ -242,7 +247,7 @@ async def demo_burst_requests(
     """Send a burst of requests."""
     tasks = [controller.process_request(user_key) for _ in range(count)]
     results = await asyncio.gather(*tasks)
-    allowed = sum(results)
+    allowed = sum(1 for r in results if r.allowed)
     blocked = count - allowed
     print(f"Results: {allowed} allowed, {blocked} blocked (total: {count})\n")
 
@@ -273,7 +278,7 @@ async def main():
     print("=== EXAMPLE 4: High concurrency ===")
     tasks = [controller.process_request() for _ in range(20)]
     results = await asyncio.gather(*tasks)
-    allowed = sum(results)
+    allowed = sum(1 for r in results if r.allowed)
     print(f"High concurrency: {allowed} allowed, {20 - allowed} blocked\n")
 
     await controller.shutdown()
