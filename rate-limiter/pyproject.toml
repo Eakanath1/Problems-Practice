@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rate-limiter"
+version = "0.1.0"
+description = "Production-ready rate limiting library for Python"
+authors = [{ name = "eakanath_r", email = "er001.me@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+examples = ["requests", "aiohttp"]
+dev = ["pytest", "mypy", "pylint"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rate_limiter*"]
+exclude = ["tests*", "examples*"]
